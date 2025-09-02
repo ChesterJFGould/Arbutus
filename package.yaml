@@ -32,6 +32,15 @@ ghc-options:
 - -Wmissing-home-modules
 - -Wpartial-fields
 - -Wredundant-constraints
+- -fdefer-typed-holes
+
+language: GHC2021
+
+default-extensions:
+- OverloadedStrings
+- DuplicateRecordFields
+- OverloadedRecordDot
+- BlockArguments
 
 library:
   source-dirs: src

@@ -1,0 +1,137 @@
+module Expr where
+
+data Type
+  = TyVar String
+  | UnVar String
+  | All String Type
+  | Fun Type Type
+
+data Expr
+  = Var String 
+  | Lam String Expr
+  | App Expr Expr | Ann Expr Type
+data Judg
+  = Sub Type Type
+  | Chk Expr Type
+  | Syn Expr String Judg
+  | Elim Type Expr String Judg
+
+data Wl
+  = Done | TypeVar Wl String
+  | UnifVar Wl String
+  | ExprVar Wl String Type
+  | Judg Wl Judg
+
+-- Fresh unification variable
+fresh :: Wl -> String
+fresh = _
+
+step :: Wl -> Maybe Wl
+step (TypeVar wl _) = Just wl
+step (UnifVar wl _) = Just wl
+step (ExprVar wl _ _) = Just wl
+step (Judg wl judg) = stepJudg wl judg
+
+-- Order unification variable by which one comes first in a wl
+orderUnifVars :: String -> String -> Wl -> (String, String)
+orderUnifVars x y (UnifVar wl z)
+  | x == z = (y, x)
+  | y == z = (x, y)
+  | otherwise = orderUnifVars x y wl
+orderUnifVars x y (TypeVar wl _) = orderUnifVars x y wl
+orderUnifVars x y (ExprVar wl _ _) = orderUnifVars x y wl
+orderUnifVars x y (Judg wl _) = orderUnifVars x y wl
+orderUnifVars _ _ _ = error "improperly scoped unification variables"
+
+-- Substitute a unification variable in a type
+solveType :: String -> Type -> Type -> Type
+solveType x val (UnVar y)
+  | x == y = val
+  | otherwise = UnVar y
+solveType _ _ (TyVar x) = TyVar x
+solveType x val (All y t) = All y (solveType x val t)
+solveType x val (Fun d c) = Fun (solveType x val d) (solveType x val c)
+
+-- Solve a unification variable in a judgment
+solveJudg :: String -> Type -> Judg -> Judg
+solveJudg = _
+
+-- Solve a unification variable
+solve :: String -> Type -> Wl -> Wl
+solve x t (UnifVar wl y)
+  | x == y = wl
+  | otherwise = UnifVar (solve x t wl) y
+solve x t (TypeVar wl y) = TypeVar (solve x t wl) y
+solve x t (ExprVar wl y t') = ExprVar (solve x t wl) y (solveType x t t')
+solve x t (Judg wl judg) = Judg (solve x t wl) (solveJudg x t judg)
+solve x t (Done) = error "improperly scoped unification variable"
+
+-- Solve a unification variable as a function type of two new unification variables
+solveFun :: String -> String -> String -> Wl -> Wl
+solveFun x d c (UnifVar wl y)
+  | x == y = (UnifVar (UnifVar wl d) c)
+  | otherwise = UnifVar (solveFun x d c wl) y
+solveFun x d c (TypeVar wl y) = TypeVar (solveFun x d c wl) y
+solveFun x d c (ExprVar wl y t) = ExprVar (solveFun x d c wl) y (solveType x (Fun (UnVar d) (UnVar c)) t)
+solveFun _ _ _ (Done) = error "improperly scoped unification variable"
+
+lookupVar :: String -> Wl -> Maybe Type
+lookupVar x (ExprVar wl x' t)
+  | x == x' = Just t
+  | otherwise = lookupVar x wl
+lookupVar x (UnifVar wl _) = lookupVar x wl
+lookupVar x (TypeVar wl _) = lookupVar x wl
+lookupVar _ (Done) = Nothing
+
+-- Substitute a type variable
+subst :: String -> Type -> Type -> Type
+subst = _
+
+substJudg :: String -> Type -> Judg -> Judg
+substJudg = _
+
+unifVars :: String -> String -> Wl -> Wl
+unifVars x y wl =
+  let
+    (first, second) = orderUnifVars x y wl
+  in
+    solve first (UnVar second) wl
+
+stepJudg :: Wl -> Judg -> Maybe Wl
+stepJudg wl (Sub (TyVar x) (TyVar y))
+  | x == y = Just wl
+stepJudg wl (Sub (UnVar x) (UnVar y))
+  | x == y = Just wl
+stepJudg wl (Sub (Fun d c) (Fun d' c')) = Just (Judg (Judg wl (Sub c c')) (Sub d' d))
+stepJudg wl (Sub (All x a) b) = Just (Judg (UnifVar wl x') (Sub (subst x (UnVar x') a) b))
+  where
+    x' = fresh wl
+stepJudg wl (Sub a (All x b)) = Just (Judg (TypeVar wl x) (Sub a b))
+stepJudg wl (Sub (UnVar x) (Fun d c)) = Just (Judg (solveFun x d' c' wl) (Sub (Fun (UnVar d') (UnVar c')) (Fun d c)))
+  where
+    d' = fresh wl
+    c' = fresh (UnifVar wl d')
+stepJudg wl (Sub (Fun d c) (UnVar x)) = Just (Judg (solveFun x d' c' wl) (Sub (Fun d c) (Fun (UnVar d') (UnVar c'))))
+  where
+    d' = fresh wl
+    c' = fresh (UnifVar wl d')
+stepJudg wl (Sub (UnVar x) (UnVar y)) = Just (solve first (UnVar second) wl)
+  where
+    (first, second) = orderUnifVars x y wl
+stepJudg wl (Sub (TyVar x) (UnVar y)) = Just (solve y (TyVar x) wl)
+stepJudg wl (Sub (UnVar x) (TyVar y)) = Just (solve x (TyVar y) wl)
+stepJudg wl (Chk e (All x t)) = Just (Judg (TypeVar wl x) (Chk e t))
+stepJudg wl (Chk (Lam x e) (Fun d c)) = Just (Judg (ExprVar wl x d) (Chk e c))
+stepJudg wl (Chk (Lam x e) (UnVar y)) = Just (Judg (ExprVar (solveFun y d c wl) x (UnVar d)) (Chk e (UnVar c)))
+  where
+    d = fresh wl
+    c = fresh (UnifVar wl d)
+stepJudg wl (Chk e t) = Just (Judg wl (Syn e x (Sub (UnVar x) t)))
+  where
+    x = fresh wl
+stepJudg wl (Syn (Var x) y j)
+  | Just t <- lookupVar x wl = Just (Judg wl (substJudg y t j))
+stepJudg wl (Syn (Lam x e) y j) = Just (Judg (ExprVar (Judg (UnifVar (UnifVar wl d) c) (substJudg y (Fun (UnVar d) (UnVar c)) j)) x (UnVar d)) (Chk e (UnVar c)))
+  where
+    d = fresh wl
+    c = fresh (UnifVar wl d)
