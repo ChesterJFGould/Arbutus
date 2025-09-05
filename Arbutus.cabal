@@ -25,8 +25,10 @@ source-repository head
 
 library
   exposed-modules:
+      Ewe
       Expr
       Lib
+      Stlc
   other-modules:
       Paths_Arbutus
   autogen-modules:
