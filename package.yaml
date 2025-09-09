@@ -41,6 +41,9 @@ default-extensions:
 - DuplicateRecordFields
 - OverloadedRecordDot
 - BlockArguments
+- ImpredicativeTypes
+- GADTs
+- Arrows
 
 library:
   source-dirs: src

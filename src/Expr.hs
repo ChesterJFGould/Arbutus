@@ -4,6 +4,7 @@ import qualified Control.Monad as Monad
 import qualified Data.Bifunctor as Bifunctor
 import Data.Foldable (foldrM, forM_)
 import qualified Data.List as List
+import Data.Maybe (mapMaybe)
 import Data.String
 
 newtype Var = MkVar { unVar :: String }
@@ -86,6 +87,7 @@ data TypeError
   | FailedToMatchParameters Expr
   | CheckExpectedButGot Expr Type Type
   | UnboundVariable Var
+  | CantSynth
   deriving Show
 
 type TC a = Either TypeError a
@@ -156,6 +158,26 @@ separateSynth ((Var x, t) : l) = Bifunctor.first ((Var x, t) :) (separateCheck l
 separateSynth ((App f args, t) : l) = Bifunctor.first ((App f args, t) :) (separateCheck l)
 separateSynth ((Lam params body, t) : l) = Bifunctor.second ((Lam params body, t) :) (separateCheck l)
 
+separate :: Ctx Kind -> Ctx Type -> [(Expr, TypePat)] -> TC ([(Type, TypePat)], [(Type -> TC (), TypePat)])
+separate kindCtx typeCtx exprTypes = do
+  res <- mapM (\(e, pat) -> (, pat) <$> trySynth kindCtx typeCtx e) exprTypes
+  return
+    ( mapMaybe
+        (\(r, pat) ->
+          case r of
+            Left t -> Just (t, pat)
+            _ -> Nothing
+        )
+        res
+    , mapMaybe
+        (\(r, pat) ->
+          case r of
+            Right chk -> Just (chk, pat)
+            _ -> Nothing
+        )
+        res
+    )
+
 instantiate :: Ctx Type -> Type -> Type
 instantiate types (TyVar x)
   | Just t <- lookupCtx x types = t
@@ -190,15 +212,18 @@ check kindCtx typeCtx (App f args) t = do
         codomainValsCtx <- typeMatch patternVarsCtx codomain t
         -- Separate argTypes into synths and checks
         --   for now, put apps in checks here, and in synths in synth
-        let (synthArgTypes, checkArgTypes) = separateCheck argTypes
+        (synthPatTypes, checks) <- separate kindCtx typeCtx argTypes
+        -- let (synthArgTypes, checkArgTypes) = separateCheck argTypes
+        -- synthArgCtxs = foldr (\(t, pat)
         -- Match synths
-        synthArgCtxs <-
-          mapM
-            (\(arg, argType) -> do
-              argType' <- synth kindCtx typeCtx arg
-              typeMatch patternVarsCtx argType argType'
-            )
-            synthArgTypes
+        -- synthArgCtxs <-
+        --   mapM
+        --     (\(arg, argType) -> do
+        --       argType' <- synth kindCtx typeCtx arg
+        --       typeMatch patternVarsCtx argType argType'
+        --     )
+        --     synthArgTypes
+        synthArgCtxs <- mapM (\(t, pat) -> typeMatch patternVarsCtx pat t) synthPatTypes
         patternValsCtx <-
           case foldrM mergeCtx codomainValsCtx synthArgCtxs of
             Just ctx -> return ctx
@@ -219,14 +244,61 @@ check kindCtx typeCtx (App f args) t = do
           Just _ ->
           -- Check checks
             forM_
-              checkArgTypes
-              (\(arg, argType) -> check kindCtx typeCtx arg (instantiate patternValsCtx argType))
+              checks
+              (\(chk, pat) -> chk (instantiate patternValsCtx pat))
       | otherwise -> typeError (AppArgLengthMismcatch args (Fun typeParams paramTypes codomain))
 check kindCtx typeCtx e t = do
   t' <- synth kindCtx typeCtx e
   case typeEq t t' of
     True -> return ()
     False -> typeError (CheckExpectedButGot e t t')
+
+trySynth :: Ctx Kind -> Ctx Type -> Expr -> TC (Either Type (Type -> TC ()))
+trySynth kindCtx typeCtx (Var x)
+  | Just t <- lookupCtx x typeCtx = return (Left t)
+  | otherwise = typeError (UnboundVariable x)
+trySynth kindCtx typeCtx (App f args) = do
+  fType <- synth kindCtx typeCtx f
+  case fType of
+    Fun typeParams paramTypes codomain
+        -- Check arg lengths line up
+      | Just argTypes <- zipIfSameLength args paramTypes -> do
+        let
+          patternVarsCtx :: Ctx ()
+          patternVarsCtx = list2Ctx (map (\(x, _) -> (x, ())) typeParams)
+        -- Separate argTypes into synths and checks
+        --   for now, put apps in checks here, and in synths in synth
+        (synthPatTypes, checks) <- separate kindCtx typeCtx argTypes
+        synthArgCtxs <- mapM (\(t, pat) -> typeMatch patternVarsCtx pat t) synthPatTypes
+        patternValsCtx <-
+          case foldrM mergeCtx emptyCtx synthArgCtxs of
+            Just ctx -> return ctx
+            Nothing -> typeError FailedToMatch
+        -- Check if all vars covered
+        case sequence (map (\(x, _) -> lookupCtx x patternValsCtx) typeParams) of
+          Nothing ->
+            return $ Right \t -> do
+              -- Match codomain
+              codomainValsCtx <- typeMatch patternVarsCtx codomain t
+              patternValsCtx' <-
+                case mergeCtx patternValsCtx codomainValsCtx of
+                  Nothing -> typeError FailedToMatch
+                  Just ctx -> return ctx
+              case sequence (map (\(x, _) -> lookupCtx x patternValsCtx') typeParams) of
+                Nothing -> typeError (FailedToMatchParameters (App f args))
+                Just _ ->
+                -- Check checks
+                  forM_
+                    checks
+                    (\(chk, pat) -> chk (instantiate patternValsCtx pat))
+          Just _ -> do
+          -- Check checks
+            forM_
+              checks
+              (\(chk, pat) -> chk (instantiate patternValsCtx pat))
+            return (Left (instantiate patternValsCtx codomain))
+      | otherwise -> typeError (AppArgLengthMismcatch args (Fun typeParams paramTypes codomain))
+trySynth _ _ _ = typeError CantSynth
 
 synth :: Ctx Kind -> Ctx Type -> Expr -> TC Type
 synth kindCtx typeCtx (Var x)
@@ -243,15 +315,8 @@ synth kindCtx typeCtx (App f args) = do
           patternVarsCtx = list2Ctx (map (\(x, _) -> (x, ())) typeParams)
         -- Separate argTypes into synths and checks
         --   for now, put apps in checks here, and in synths in synth
-        let (synthArgTypes, checkArgTypes) = separateSynth argTypes
-        -- Match synths
-        synthArgCtxs <-
-          mapM
-            (\(arg, argType) -> do
-              argType' <- synth kindCtx typeCtx arg
-              typeMatch patternVarsCtx argType argType'
-            )
-            synthArgTypes
+        (synthPatTypes, checks) <- separate kindCtx typeCtx argTypes
+        synthArgCtxs <- mapM (\(t, pat) -> typeMatch patternVarsCtx pat t) synthPatTypes
         patternValsCtx <-
           case foldrM mergeCtx emptyCtx synthArgCtxs of
             Just ctx -> return ctx
@@ -272,7 +337,8 @@ synth kindCtx typeCtx (App f args) = do
           Just _ -> do
           -- Check checks
             forM_
-              checkArgTypes
-              (\(arg, argType) -> check kindCtx typeCtx arg (instantiate patternValsCtx argType))
+              checks
+              (\(chk, pat) -> chk (instantiate patternValsCtx pat))
             return (instantiate patternValsCtx codomain)
       | otherwise -> typeError (AppArgLengthMismcatch args (Fun typeParams paramTypes codomain))
+synth _ _ _ = typeError CantSynth

@@ -48,15 +48,16 @@ parens p = do
   return pv
 
 
-checkSynth :: Ctx Type -> Type -> Parser Char Expr
-checkSynth ctx t = validate $ do
-  (e, t') <- synth ctx
-  if t == t'
-  then pure (Right e)
-  else pure (Left "types don't match")
+checkSynth :: Parser Char ((Ctx Type, Type) -> Parser Char Expr)
+checkSynth = validate $ do
+  (e, t) <- synth
+  return \(ctx, t') ->
+    if t == t'
+    then pure (Right e)
+    else pure (Left "types don't match")
 
-lam :: Ctx Type -> Type -> Parser Char Expr
-lam ctx (Fun d c) = do
+lam :: Parser Char ((Ctx Type, Type) -> Parser Char Expr)
+lam = validate $ do
   tok '\\'
   whitespace
   x <- var
@@ -64,11 +65,13 @@ lam ctx (Fun d c) = do
   tok '-'
   tok '>'
   whitespace
-  e <- check (insertCtx x d ctx) c
-  return (Lam x e)
-lam _ _ = empty
+  e <- check
+  return \(ctx, t) ->
+    case t of
+      (Fun d c) -> Right (Lam x <$> (e <*> (ctx, c)))
+      _ -> Left ("didn't expect lambda")
 
-check :: Ctx Type -> Type -> Parser Char Expr
+check :: Parser Char ((Ctx Type, Type) -> Parser Char Expr)
 check ctx t = lam ctx t <|> parens (check ctx t) <|> checkSynth ctx t
 
 synthVar :: Ctx Type -> Parser Char (Expr, Type)
@@ -78,5 +81,9 @@ synthVar ctx = validate $ do
     Nothing -> pure (Left "unbound variable")
     Just t -> pure (Right (Var x, t))
 
-synth :: Ctx Type -> Parser Char (Expr, Type)
+synth :: Parser Char (Ctx Type -> Parser Char (Expr, Type))
 synth ctx = synthVar ctx
+
+{-
+ann :: Parser Char (Ctx Type) (Type, Expr)
+-}

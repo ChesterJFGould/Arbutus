@@ -1,4 +1,4 @@
-{-# LANGUAGE GADTs, ApplicativeDo, DerivingVia #-}
+{-# LANGUAGE GADTs, ApplicativeDo, DerivingVia, ImpredicativeTypes #-}
 module Ewe where
 
 import Control.Applicative
@@ -11,7 +11,23 @@ data Parser t a where
   Alt :: Parser t a -> Parser t a -> Parser t a
   Is :: (t -> Bool) -> Parser t t
   Fail :: Parser t a
-  Validate :: Parser t (Either String a) -> Parser t a
+  -- The point of Validate is to take a parser which returns a function from some context to the actual parser output or an error,
+  -- and then turn it into a parser which returns a function which when applied to the context, turns the error into a nice parser error
+  -- pointing to the piece of text which the validation function was originally parsed.
+  -- The problem to solve is what the output type of the returned validation function is.
+  -- If it is (b -> Parser t a), then this implies that it could potentially consume some input, which it won't
+  --   Maybe just go with this for now and figure out something nicer later?
+  --   This is actually useless, since this functionality is derivable
+  --   validate :: Parser t (b -> Either String a) -> Parser t (b -> Parser t a)
+  --   validate p = do
+  --     validator <- p
+  --     return \b ->
+  --       case validator b of
+  --         Left _ -> Fail
+  --         Right a -> Pure a
+  -- Maybe we can fix this by using arrowized parsers instead of applicative?
+  --   See EweArrowized.hs
+  Validate :: Parser t (b -> Either String a) -> Parser t (b -> Parser t a)
 
 bind :: Parser t a -> (a -> Parser t b) -> Parser t b
 bind (Pure a) k = k a
@@ -53,11 +69,15 @@ parse (Is p) (t : ts)
   | otherwise = Nothing
 parse (Is _) [] = Nothing
 parse (Fail) _ = Nothing
-parse (Validate a) ts = do
-  (aOrErr, ts') <- parse a ts
-  case aOrErr of
-    Left _ -> Nothing
-    Right a -> Just (a, ts')
+parse (Validate p) ts = do
+  (validator, ts') <- parse p ts
+  Just
+    ( \b ->
+        case validator b of
+          Left _ -> Fail
+          Right a -> Pure a
+    , ts'
+    )
 
 is :: (t -> Bool) -> Parser t t
 is = Is
@@ -68,5 +88,10 @@ tok t = is (== t) *> pure ()
 whitespace :: Parser Char ()
 whitespace = many (is Char.isSpace) *> pure ()
 
-validate :: Parser t (Either String a) -> Parser t a
-validate = Validate
+validate :: Parser t (b -> Either String a) -> Parser t (b -> Parser t a)
+validate p = do
+  validator <- p
+  return \b ->
+    case validator b of
+      Left _ -> Fail
+      Right a -> Pure a
