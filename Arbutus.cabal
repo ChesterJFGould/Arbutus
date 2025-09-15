@@ -26,7 +26,7 @@ source-repository head
 library
   exposed-modules:
       Ewe
-      EweArrowized
+      EweBnf
       Expr
       Lib
       Stlc
@@ -47,6 +47,7 @@ library
   ghc-options: -Wall -Wcompat -Widentities -Wincomplete-record-updates -Wincomplete-uni-patterns -Wmissing-export-lists -Wmissing-home-modules -Wpartial-fields -Wredundant-constraints -fdefer-typed-holes
   build-depends:
       base >=4.7 && <5
+    , comonad
   default-language: GHC2021
 
 executable Arbutus-exe
@@ -69,6 +70,7 @@ executable Arbutus-exe
   build-depends:
       Arbutus
     , base >=4.7 && <5
+    , comonad
   default-language: GHC2021
 
 test-suite Arbutus-test
@@ -92,4 +94,5 @@ test-suite Arbutus-test
   build-depends:
       Arbutus
     , base >=4.7 && <5
+    , comonad
   default-language: GHC2021

@@ -1,11 +1,14 @@
 module Expr where
 
+import Control.Applicative
 import qualified Control.Monad as Monad
 import qualified Data.Bifunctor as Bifunctor
+import qualified Data.Char as Char
 import Data.Foldable (foldrM, forM_)
 import qualified Data.List as List
 import Data.Maybe (mapMaybe)
 import Data.String
+import Ewe
 
 newtype Var = MkVar { unVar :: String }
   deriving (Eq, Show)
@@ -144,201 +147,55 @@ zipIfSameLength [] [] = Just []
 zipIfSameLength (a : al) (b : bl) = ((a, b) :) <$> zipIfSameLength al bl
 zipIfSameLength _ _ = Nothing
 
--- Separate expressions into synths and checks during check
-separateCheck :: [(Expr, Type)] -> ([(Expr, Type)], [(Expr, Type)])
-separateCheck [] = ([], [])
-separateCheck ((Var x, t) : l) = Bifunctor.first ((Var x, t) :) (separateCheck l)
-separateCheck ((App f args, t) : l) = Bifunctor.second ((App f args, t) :) (separateCheck l)
-separateCheck ((Lam params body, t) : l) = Bifunctor.second ((Lam params body, t) :) (separateCheck l)
+varChar :: Parser l Char Char
+varChar = is Char.isLetter
 
--- Separate expressions into synths and checks during synth
-separateSynth :: [(Expr, Type)] -> ([(Expr, Type)], [(Expr, Type)])
-separateSynth [] = ([], [])
-separateSynth ((Var x, t) : l) = Bifunctor.first ((Var x, t) :) (separateCheck l)
-separateSynth ((App f args, t) : l) = Bifunctor.first ((App f args, t) :) (separateCheck l)
-separateSynth ((Lam params body, t) : l) = Bifunctor.second ((Lam params body, t) :) (separateCheck l)
+var :: Parser l Char Var
+var = MkVar <$> some varChar
 
-separate :: Ctx Kind -> Ctx Type -> [(Expr, TypePat)] -> TC ([(Type, TypePat)], [(Type -> TC (), TypePat)])
-separate kindCtx typeCtx exprTypes = do
-  res <- mapM (\(e, pat) -> (, pat) <$> trySynth kindCtx typeCtx e) exprTypes
-  return
-    ( mapMaybe
-        (\(r, pat) ->
-          case r of
-            Left t -> Just (t, pat)
-            _ -> Nothing
+checkDuplicates :: Validator l [Var] -> [Validator l Var] -> Validator l [Var]
+checkDuplicates vs [] = vs
+checkDuplicates vs (v : rest) =
+  checkDuplicates
+    ( validatorJoin $ fmap
+        (\xs ->
+          handle $ fmap
+            (\x ->
+              if elem x xs
+              then Left (concat ["Variable `", show x, "` is a duplicate in the parameter list. Duplicates are not allowed."])
+              else Right (xs ++ [x])
+            )
+            v
         )
-        res
-    , mapMaybe
-        (\(r, pat) ->
-          case r of
-            Right chk -> Just (chk, pat)
-            _ -> Nothing
-        )
-        res
+        vs
+    )
+    rest
+
+lamValidator :: Validator l Var -> [Validator l Var] -> (Ctx Kind -> Ctx Type -> Type -> Validator l Expr) -> (Ctx Kind -> Ctx Type -> ([(Var, Kind)], [Type], Type) -> Validator l Expr)
+lamValidator firstVar restVar body kindCtx typeCtx t =
+  checkDuplicates ((\x -> [x]) <$> firstVar) restVar
+
+lamCheckValidator :: Validator l (Ctx Kind -> Ctx Type -> ([(Var, Kind)], [Type], Type) -> Validator l Expr) -> (Ctx Kind -> Ctx Type -> Type -> Validator l Expr)
+lamCheckValidator lamv kindCtx typeCtx t =
+  validatorJoin $ handle $ fmap
+    (\lamv' ->
+      case t of
+        Fun typeParams domains codomain -> Right (lamv' kindCtx typeCtx (typeParams, domains, codomain))
+        _ -> Left (concat ["Expected an expression of type `", show t, "` but found a lambda"])
+    )
+    lamv
+
+lam :: Parser l Char (Ctx Kind -> Ctx Type -> Type -> Validator l Expr)
+lam =
+  fmap lamCheckValidator $ startValidation
+    ( lamValidator
+      <$> (tok '\\' *> whitespace *> startValidation var <* whitespace)
+      <*> many (tok ',' *> whitespace *> startValidation var <* whitespace)
+      <*> (tok '-' *> tok '>' *> whitespace *> check)
     )
 
-instantiate :: Ctx Type -> Type -> Type
-instantiate types (TyVar x)
-  | Just t <- lookupCtx x types = t
-  | otherwise = TyVar x
-instantiate types (Fun typeParams paramTypes codomain) =
-  let
-    -- TODO: Definitely an error, need to do capture avoiding substitution
-    types' = foldr (\(x, _) types -> removeCtx x types) types typeParams
-  in
-    Fun typeParams (map (instantiate types') paramTypes) (instantiate types' codomain)
+check :: Parser l Char (Ctx Kind -> Ctx Type -> Type -> Validator l Expr)
+check = _
 
-check :: Ctx Kind -> Ctx Type -> Expr -> Type -> TC ()
-check kindCtx typeCtx (Lam params body) (Fun typeParams paramTypes codomain)
-  | length params == length paramTypes =
-      check
-        (listInsertCtx typeParams kindCtx)
-        (listInsertCtx (zip params paramTypes) typeCtx)
-        body
-        codomain
-  | otherwise = typeError (ArgumentLengthMismatch (Lam params body) (Fun typeParams paramTypes codomain))
-check _ _ (Lam params body) t = typeError (CheckMismatch (Lam params body) t)
-check kindCtx typeCtx (App f args) t = do
-  fType <- synth kindCtx typeCtx f
-  case fType of
-    Fun typeParams paramTypes codomain
-        -- Check arg lengths line up
-      | Just argTypes <- zipIfSameLength args paramTypes -> do
-        let
-          patternVarsCtx :: Ctx ()
-          patternVarsCtx = list2Ctx (map (\(x, _) -> (x, ())) typeParams)
-        -- Match codomain
-        codomainValsCtx <- typeMatch patternVarsCtx codomain t
-        -- Separate argTypes into synths and checks
-        --   for now, put apps in checks here, and in synths in synth
-        (synthPatTypes, checks) <- separate kindCtx typeCtx argTypes
-        -- let (synthArgTypes, checkArgTypes) = separateCheck argTypes
-        -- synthArgCtxs = foldr (\(t, pat)
-        -- Match synths
-        -- synthArgCtxs <-
-        --   mapM
-        --     (\(arg, argType) -> do
-        --       argType' <- synth kindCtx typeCtx arg
-        --       typeMatch patternVarsCtx argType argType'
-        --     )
-        --     synthArgTypes
-        synthArgCtxs <- mapM (\(t, pat) -> typeMatch patternVarsCtx pat t) synthPatTypes
-        patternValsCtx <-
-          case foldrM mergeCtx codomainValsCtx synthArgCtxs of
-            Just ctx -> return ctx
-            Nothing -> typeError FailedToMatch
-        {-
-        patternValsCtx'' <-
-          foldrM
-            (\(arg, argType) patternValsCtx'' -> do
-              argType' <- synth kindCtx typeCtx arg
-              typeMatch patternVarsCtx patternValsCtx'' argType argType'
-            )
-            patternValsCtx'
-            synthArgTypes
-        -}
-        -- Check if all vars covered
-        case sequence (map (\(x, _) -> lookupCtx x patternValsCtx) typeParams) of
-          Nothing -> typeError (FailedToMatchParameters (App f args))
-          Just _ ->
-          -- Check checks
-            forM_
-              checks
-              (\(chk, pat) -> chk (instantiate patternValsCtx pat))
-      | otherwise -> typeError (AppArgLengthMismcatch args (Fun typeParams paramTypes codomain))
-check kindCtx typeCtx e t = do
-  t' <- synth kindCtx typeCtx e
-  case typeEq t t' of
-    True -> return ()
-    False -> typeError (CheckExpectedButGot e t t')
-
-trySynth :: Ctx Kind -> Ctx Type -> Expr -> TC (Either Type (Type -> TC ()))
-trySynth kindCtx typeCtx (Var x)
-  | Just t <- lookupCtx x typeCtx = return (Left t)
-  | otherwise = typeError (UnboundVariable x)
-trySynth kindCtx typeCtx (App f args) = do
-  fType <- synth kindCtx typeCtx f
-  case fType of
-    Fun typeParams paramTypes codomain
-        -- Check arg lengths line up
-      | Just argTypes <- zipIfSameLength args paramTypes -> do
-        let
-          patternVarsCtx :: Ctx ()
-          patternVarsCtx = list2Ctx (map (\(x, _) -> (x, ())) typeParams)
-        -- Separate argTypes into synths and checks
-        --   for now, put apps in checks here, and in synths in synth
-        (synthPatTypes, checks) <- separate kindCtx typeCtx argTypes
-        synthArgCtxs <- mapM (\(t, pat) -> typeMatch patternVarsCtx pat t) synthPatTypes
-        patternValsCtx <-
-          case foldrM mergeCtx emptyCtx synthArgCtxs of
-            Just ctx -> return ctx
-            Nothing -> typeError FailedToMatch
-        -- Check if all vars covered
-        case sequence (map (\(x, _) -> lookupCtx x patternValsCtx) typeParams) of
-          Nothing ->
-            return $ Right \t -> do
-              -- Match codomain
-              codomainValsCtx <- typeMatch patternVarsCtx codomain t
-              patternValsCtx' <-
-                case mergeCtx patternValsCtx codomainValsCtx of
-                  Nothing -> typeError FailedToMatch
-                  Just ctx -> return ctx
-              case sequence (map (\(x, _) -> lookupCtx x patternValsCtx') typeParams) of
-                Nothing -> typeError (FailedToMatchParameters (App f args))
-                Just _ ->
-                -- Check checks
-                  forM_
-                    checks
-                    (\(chk, pat) -> chk (instantiate patternValsCtx pat))
-          Just _ -> do
-          -- Check checks
-            forM_
-              checks
-              (\(chk, pat) -> chk (instantiate patternValsCtx pat))
-            return (Left (instantiate patternValsCtx codomain))
-      | otherwise -> typeError (AppArgLengthMismcatch args (Fun typeParams paramTypes codomain))
-trySynth _ _ _ = typeError CantSynth
-
-synth :: Ctx Kind -> Ctx Type -> Expr -> TC Type
-synth kindCtx typeCtx (Var x)
-  | Just t <- lookupCtx x typeCtx = return t
-  | otherwise = typeError (UnboundVariable x)
-synth kindCtx typeCtx (App f args) = do
-  fType <- synth kindCtx typeCtx f
-  case fType of
-    Fun typeParams paramTypes codomain
-        -- Check arg lengths line up
-      | Just argTypes <- zipIfSameLength args paramTypes -> do
-        let
-          patternVarsCtx :: Ctx ()
-          patternVarsCtx = list2Ctx (map (\(x, _) -> (x, ())) typeParams)
-        -- Separate argTypes into synths and checks
-        --   for now, put apps in checks here, and in synths in synth
-        (synthPatTypes, checks) <- separate kindCtx typeCtx argTypes
-        synthArgCtxs <- mapM (\(t, pat) -> typeMatch patternVarsCtx pat t) synthPatTypes
-        patternValsCtx <-
-          case foldrM mergeCtx emptyCtx synthArgCtxs of
-            Just ctx -> return ctx
-            Nothing -> typeError FailedToMatch
-        {-
-        patternValsCtx'' <-
-          foldrM
-            (\(arg, argType) patternValsCtx'' -> do
-              argType' <- synth kindCtx typeCtx arg
-              typeMatch patternVarsCtx patternValsCtx'' argType argType'
-            )
-            patternValsCtx'
-            synthArgTypes
-        -}
-        -- Check if all vars covered
-        case sequence (map (\(x, _) -> lookupCtx x patternValsCtx) typeParams) of
-          Nothing -> typeError (FailedToMatchParameters (App f args))
-          Just _ -> do
-          -- Check checks
-            forM_
-              checks
-              (\(chk, pat) -> chk (instantiate patternValsCtx pat))
-            return (instantiate patternValsCtx codomain)
-      | otherwise -> typeError (AppArgLengthMismcatch args (Fun typeParams paramTypes codomain))
-synth _ _ _ = typeError CantSynth
+synth :: Parser l Char (Ctx Kind -> Ctx Type -> Validator l (Type, Expr))
+synth = _

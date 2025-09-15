@@ -1,11 +1,15 @@
 module Stlc where
 
 import qualified Data.Char as Char
+import Data.String
 import Control.Applicative
 import Ewe
 
 data Var = MkVar String
   deriving (Eq, Show)
+
+instance IsString Var where
+  fromString = MkVar
 
 data Type
   = Nat
@@ -32,58 +36,73 @@ lookupCtx x ((x', v) : ctx)
   | x == x' = Just v
   | otherwise = lookupCtx x ctx
 
-varChar :: Parser Char Char
+varChar :: Parser l Char Char
 varChar = is Char.isLetter
 
-var :: Parser Char Var
+var :: Parser l Char Var
 var = MkVar <$> some varChar
 
-parens :: Parser Char a -> Parser Char a
-parens p = do
-  tok '('
-  whitespace
-  pv <- p
-  whitespace
-  tok ')'
-  return pv
+parens :: Parser l Char a -> Parser l Char a
+parens p = tok '(' *> whitespace *> p <* whitespace <* tok ')'
 
+checkSynthValidator :: (Ctx Type -> Validator l (Type, Expr)) -> Ctx Type -> Type -> Validator l Expr
+checkSynthValidator s ctx t =
+  handle $ fmap
+    (\(t', e) ->
+      case t == t' of
+        True -> Right e
+        False -> Left (concat ["Expected a `", show t, "` but got a `", show t', "`"])
+    )
+    (s ctx)
 
-checkSynth :: Parser Char ((Ctx Type, Type) -> Parser Char Expr)
-checkSynth = validate $ do
-  (e, t) <- synth
-  return \(ctx, t') ->
-    if t == t'
-    then pure (Right e)
-    else pure (Left "types don't match")
+checkSynth :: Parser l Char (Ctx Type -> Type -> Validator l Expr)
+checkSynth = checkSynthValidator <$> varSynth
 
-lam :: Parser Char ((Ctx Type, Type) -> Parser Char Expr)
-lam = validate $ do
-  tok '\\'
-  whitespace
-  x <- var
-  whitespace
-  tok '-'
-  tok '>'
-  whitespace
-  e <- check
-  return \(ctx, t) ->
-    case t of
-      (Fun d c) -> Right (Lam x <$> (e <*> (ctx, c)))
-      _ -> Left ("didn't expect lambda")
+check :: Parser l Char (Ctx Type -> Type -> Validator l Expr)
+check = checkSynth
 
-check :: Parser Char ((Ctx Type, Type) -> Parser Char Expr)
-check ctx t = lam ctx t <|> parens (check ctx t) <|> checkSynth ctx t
+funValidation :: (Ctx Type -> Validator l (Type, Expr)) -> Ctx Type -> Validator l (Type, Type, Expr)
+funValidation fv ctx =
+  handle $ fmap
+    (\(t, f) ->
+      case t of
+        Fun domain codomain -> Right (domain, codomain, f)
+        _ -> Left (concat ["Expected a function, but is of type `", show t, "`"])
+    )
+    (fv ctx)
 
-synthVar :: Ctx Type -> Parser Char (Expr, Type)
-synthVar ctx = validate $ do
-  x <- var
-  case lookupCtx x ctx of
-    Nothing -> pure (Left "unbound variable")
-    Just t -> pure (Right (Var x, t))
+appValidator :: (Ctx Type -> Validator l (Type, Type, Expr)) -> (Ctx Type -> Type -> Validator l Expr) -> Ctx Type -> Validator l (Type, Expr)
+appValidator fv argv ctx =
+  validatorBind
+    (fv ctx)
+    ( \(domain, codomain, f) ->
+        (\arg -> (codomain, App f arg)) <$> (argv ctx domain)
+    )
 
-synth :: Parser Char (Ctx Type -> Parser Char (Expr, Type))
-synth ctx = synthVar ctx
+app :: Parser l Char (Ctx Type -> Validator l (Type, Expr))
+app =
+  appValidator
+    <$> ((funValidation <$> varSynth) <* whitespace)
+    <*> parens check
 
-{-
-ann :: Parser Char (Ctx Type) (Type, Expr)
--}
+varValidation :: Validator l Var -> Ctx Type -> Validator l (Type, Expr)
+varValidation v ctx =
+  handle $ fmap
+    (\x ->
+      case lookupCtx x ctx of
+        Nothing -> Left (concat ["Unbound variable `", show x, "`"])
+        Just t -> Right (t, Var x)
+    )
+    v
+
+varSynth :: Parser l Char (Ctx Type -> Validator l (Type, Expr))
+varSynth = varValidation <$> startValidation var
+
+synth :: Parser l Char (Ctx Type -> Validator l (Type, Expr))
+synth = app <|> varSynth <|> parens synth
+
+topValidator :: Ctx Type -> (Ctx Type -> Validator l (Type, Expr)) -> Validator l (Type, Expr)
+topValidator ctx s = s ctx
+
+top :: Ctx Type -> Parser l Char (Type, Expr)
+top ctx = validate $ topValidator ctx <$> app
