@@ -1,5 +1,5 @@
 {-# LANGUAGE GADTs, ApplicativeDo, DerivingVia, ImpredicativeTypes #-}
-module Ewe (Parser, Validator, handle, validate, is, tok, validatorJoin, whitespace, startValidation, validatorBind, parse, parseFile, parseFilePrintError)  where
+module Ewe (Parser, Parsed, ParseError, handle, validate, throw, is, tok, whitespace, parse, parseFile, parseFilePrintError)  where
 
 import Control.Applicative
 import Control.Comonad
@@ -7,6 +7,7 @@ import qualified Data.Bifunctor as Bifunctor
 import qualified Data.Char as Char
 import System.IO
 
+{-
 data Validator srcloc a = Validator srcloc (Either String a)
 
 instance Functor (Validator srcloc) where
@@ -16,13 +17,44 @@ handle :: Validator srcloc (Either String a) -> Validator srcloc a
 handle (Validator l (Right (Left err))) = Validator l (Left err)
 handle (Validator l (Left err)) = Validator l (Left err)
 handle (Validator l (Right (Right a))) = Validator l (Right a)
+-}
 
+data Parsed l a = Parsed l a
+
+instance Functor (Parsed l) where
+  fmap f (Parsed l a) = Parsed l (f a)
+
+instance Foldable (Parsed l) where
+  foldMap f (Parsed _ a) = f a
+
+instance Traversable (Parsed l) where
+  sequenceA (Parsed l a) = Parsed l <$> a
+
+instance Comonad (Parsed l) where
+  extract (Parsed _ a) = a
+  extend f (Parsed l a) = Parsed l (f (Parsed l a))
+
+data ParseError srcloc = ParseError srcloc String
+
+handle :: Parsed l (Either String a) -> Either (ParseError l) a
+handle (Parsed l (Left msg)) = Left (ParseError l msg)
+handle (Parsed l (Right a)) = Right a
+
+{-
+-- Outside in
 validatorJoin :: Validator srcloc (Validator srcloc a) -> Validator srcloc a
 validatorJoin (Validator l (Left err)) = Validator l (Left err)
 validatorJoin (Validator _ (Right v)) = v
 
+-- Inside out
+validatorJoinInside :: Validator srcloc (Validator srcloc a) -> Validator srcloc a
+validatorJoinInside (Validator _ (Right (Validator l (Left err)))) = Validator l (Left err)
+validatorJoinInside (Validator l (Right (Validator _ (Right a)))) = Validator l (Right a)
+validatorJoinInside (Validator l (Left err)) = Validator l (Left err)
+
 validatorBind :: Validator l a -> (a -> Validator l b) -> Validator l b
 validatorBind a f = validatorJoin (f <$> a)
+-}
 
 data Parser l t a where
   Pure :: a -> Parser l t a
@@ -47,8 +79,8 @@ data Parser l t a where
   --         Right a -> Pure a
   -- Maybe we can fix this by using arrowized parsers instead of applicative?
   --   See EweArrowized.hs
-  StartValidation :: Parser l t a -> Parser l t (Validator l a)
-  Validate :: Parser l t (Validator l a) -> Parser l t a
+  Validate :: Parser l t a -> Parser l t (Parsed l a)
+  Throw :: Parser l t (Either (ParseError l) a) -> Parser l t a
 
 -- bind :: Parser t a -> (a -> Parser t b) -> Parser t b
 -- bind (Pure a) k = k a
@@ -75,8 +107,8 @@ acceptsEmpty (App f a) = acceptsEmpty f && acceptsEmpty a
 acceptsEmpty (Alt a b) = acceptsEmpty a || acceptsEmpty b
 acceptsEmpty (Is _) = False
 acceptsEmpty (Fail) = False
-acceptsEmpty (StartValidation p) = acceptsEmpty p
 acceptsEmpty (Validate p) = acceptsEmpty p
+acceptsEmpty (Throw p) = acceptsEmpty p
 
 acceptsTok :: Parser l t a -> t -> Bool
 acceptsTok (Pure _) _ = True
@@ -86,8 +118,8 @@ acceptsTok (App f a) t
 acceptsTok (Alt a b) t = acceptsTok a t || acceptsTok b t
 acceptsTok (Is p) t = p t
 acceptsTok (Fail) _ = False
-acceptsTok (StartValidation p) t = acceptsTok p t
 acceptsTok (Validate p) t = acceptsTok p t
+acceptsTok (Throw p) t = acceptsTok p t
 
 parse :: Show t => Parser () t a -> [t] -> Either String (a, [t])
 parse (Pure a) ts = Right (a, ts)
@@ -106,22 +138,20 @@ parse (Is p) (t : ts)
   | otherwise = Left (concat ["Unexpected token `", show t, "`"])
 parse (Is _) [] = Left "Unexpected end of input"
 parse (Fail) _ = Left "Failed to parse"
-parse (StartValidation p) ts = do
-  (a, ts') <- parse p ts
-  return (Validator () (Right a), ts')
 parse (Validate p) ts = do
-  (validator, ts') <- parse p ts
-  case validator of
-    (Validator _ (Left err)) -> Left err
-    (Validator _ (Right a)) -> Right (a, ts')
+  (a, ts') <- parse p ts
+  return (Parsed () a, ts')
+parse (Throw p) ts = do
+  (parsed, ts') <- parse p ts
+  case parsed of
+    (Left (ParseError () err)) -> Left err
+    (Right a) -> Right (a, ts')
 
 data FilePos = FilePos { line :: Int, col :: Int }
   deriving Show
 
 data FileRange = FileRange { start :: FilePos, end :: FilePos }
   deriving Show
-
-data FileError = FileError { range :: FileRange, msg :: String }
 
 advanceFilePos :: Char -> FilePos -> FilePos
 advanceFilePos '\n' fp = FilePos (fp.line + 1) 0
@@ -141,7 +171,7 @@ parseFile p path = do
     Left err -> return (Left (printFileError err path))
     Right (pv, _) -> return (Right pv)
 
-parseFile' :: Parser FileRange Char a -> FilePos -> Handle -> IO (Either FileError (a, FilePos))
+parseFile' :: Parser FileRange Char a -> FilePos -> Handle -> IO (Either (ParseError FileRange) (a, FilePos))
 parseFile' (Pure a) fp _ = return (Right (a, fp))
 parseFile' (App f a) fp h = do
   fvOrErr <- parseFile' f fp h
@@ -167,31 +197,31 @@ parseFile' (Alt a b) fp h = do
 parseFile' (Is p) fp h = do
   eof <- hIsEOF h
   if eof
-  then return (Left (FileError (FileRange fp fp) "Unexpected end-of-file"))
+  then return (Left (ParseError (FileRange fp fp) "Unexpected end-of-file"))
   else do
     c <- hGetChar h
     if p c
     then return (Right (c, advanceFilePos c fp))
-    else return (Left (FileError (FileRange fp fp) (concat ["Unexpected character ", show c])))
-parseFile' (Fail) fp _ = return (Left (FileError (FileRange fp fp) "Parsing failed"))
-parseFile' (StartValidation p) start h = do
+    else return (Left (ParseError (FileRange fp fp) (concat ["Unexpected character ", show c])))
+parseFile' (Fail) fp _ = return (Left (ParseError (FileRange fp fp) "Parsing failed"))
+parseFile' (Validate p) start h = do
   pvOrErr <- parseFile' p start h
   case pvOrErr of
     Left err -> return (Left err)
-    Right (pv, end) -> return (Right (Validator (FileRange start end) (Right pv), end))
-parseFile' (Validate p) fp h = do
+    Right (pv, end) -> return (Right (Parsed (FileRange start end) pv, end))
+parseFile' (Throw p) fp h = do
   pvOrErr <- parseFile' p fp h
   case pvOrErr of
     Left err -> return (Left err)
-    Right (Validator range (Left msg), _) -> return (Left (FileError range msg))
-    Right (Validator _ (Right pv), fp') -> return (Right (pv, fp'))
+    Right (Left err, _) -> return (Left err)
+    Right (Right pv, fp') -> return (Right (pv, fp'))
 
 
-printFileError :: FileError -> FilePath -> IO ()
-printFileError err path = do
-  hPutStrLn stderr (concat ["Error: ", err.msg])
+printFileError :: ParseError FileRange -> FilePath -> IO ()
+printFileError (ParseError range msg) path = do
+  hPutStrLn stderr (concat ["Error: ", msg])
   hPutStrLn stderr ""
-  hPrintFileRange stderr err.range path
+  hPrintFileRange stderr range path
 
 hPrintFileRange :: Handle -> FileRange -> FilePath -> IO ()
 hPrintFileRange herr range path = do
@@ -264,8 +294,8 @@ tok t = is (== t) *> pure ()
 whitespace :: Parser l Char ()
 whitespace = many (is Char.isSpace) *> pure ()
 
-startValidation :: Parser l t a -> Parser l t (Validator l a)
-startValidation = StartValidation
-
-validate :: Parser l t (Validator l a) -> Parser l t a
+validate :: Parser l t a -> Parser l t (Parsed l a)
 validate = Validate
+
+throw :: Parser l t (Either (ParseError l) a) -> Parser l t a
+throw = Throw

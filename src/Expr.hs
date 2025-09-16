@@ -2,6 +2,7 @@ module Expr where
 
 import Control.Applicative
 import qualified Control.Monad as Monad
+import qualified Control.Comonad as Comonad
 import qualified Data.Bifunctor as Bifunctor
 import qualified Data.Char as Char
 import Data.Foldable (foldrM, forM_)
@@ -81,6 +82,7 @@ mergeCtx a b =
       True -> Just ctx
       False -> Nothing
 
+{-
 data TypeError
   = ArgumentLengthMismatch Expr Type
   | CheckMismatch Expr Type
@@ -92,8 +94,9 @@ data TypeError
   | UnboundVariable Var
   | CantSynth
   deriving Show
+-}
 
-type TC a = Either TypeError a
+-- type TC a = Either TypeError a
 
 data AlphaEquiv = AlphaEquiv { ctxL :: Ctx Int, ctxR :: Ctx Int, level :: Int }
 
@@ -115,9 +118,10 @@ alphaEquiv x y ae
   , Nothing <- lookupCtx y ae.ctxR = x == y
   | otherwise = False
 
-typeError :: TypeError -> TC a
-typeError = Left
+-- typeError :: TypeError -> TC a
+-- typeError = Left
 
+{-
 typeMatch :: Ctx () -> TypePat -> Type -> TC (Ctx Type)
 typeMatch vars l r =
   case typeMatch' vars emptyAlphaEquiv l r of
@@ -141,6 +145,7 @@ typeEq :: Type -> Type -> Bool
 typeEq a b
   | Just _ <- typeMatch' emptyCtx emptyAlphaEquiv a b = True
   | otherwise = False
+-}
 
 zipIfSameLength :: [a] -> [b] -> Maybe [(a, b)]
 zipIfSameLength [] [] = Just []
@@ -153,31 +158,55 @@ varChar = is Char.isLetter
 var :: Parser l Char Var
 var = MkVar <$> some varChar
 
-checkDuplicates :: Validator l [Var] -> [Validator l Var] -> Validator l [Var]
-checkDuplicates vs [] = vs
-checkDuplicates vs (v : rest) =
-  checkDuplicates
-    ( validatorJoin $ fmap
-        (\xs ->
-          handle $ fmap
-            (\x ->
-              if elem x xs
-              then Left (concat ["Variable `", show x, "` is a duplicate in the parameter list. Duplicates are not allowed."])
-              else Right (xs ++ [x])
-            )
-            v
-        )
-        vs
-    )
-    rest
+type TC l a = Either (ParseError l) a
 
-lamValidator :: Validator l Var -> [Validator l Var] -> (Ctx Kind -> Ctx Type -> Type -> Validator l Expr) -> (Ctx Kind -> Ctx Type -> ([(Var, Kind)], [Type], Type) -> Validator l Expr)
-lamValidator firstVar restVar body kindCtx typeCtx t =
-  checkDuplicates ((\x -> [x]) <$> firstVar) restVar
+checkDuplicates :: [Var] -> [Parsed l Var] -> TC l [Var]
+checkDuplicates xs [] = Right xs
+checkDuplicates xs (v : rest) = do
+  xs' <-
+    handle $ fmap
+      (\x ->
+        if elem x xs
+        then Left (concat ["Variable `", show x, "` is a duplicate in the parameter list. Duplicates are not allowed."])
+        else Right (xs ++ [x])
+      )
+      v
+  checkDuplicates xs' rest
 
-lamCheckValidator :: Validator l (Ctx Kind -> Ctx Type -> ([(Var, Kind)], [Type], Type) -> Validator l Expr) -> (Ctx Kind -> Ctx Type -> Type -> Validator l Expr)
+lamValidator :: Parsed l (Parsed l Var, [Parsed l Var]) -> (Ctx Kind -> Ctx Type -> Type -> TC l Expr) -> (Ctx Kind -> Ctx Type -> ([(Var, Kind)], [Type], Type) -> TC l Expr)
+lamValidator vars body kindCtx typeCtx (typeParams, domains, codomain) = do
+  params <-
+    sequenceA $ fmap
+      (\(firstVar, restVars) ->
+        checkDuplicates [Comonad.extract firstVar] restVars
+      )
+      vars
+  paramTypes <-
+    handle $ fmap
+      (\xs ->
+        case zipIfSameLength xs domains of
+          Just xTypes -> Right xTypes
+          Nothing ->
+            Left $ concat
+              ["Expected "
+              , show (length domains)
+              , " parameter(s), but found "
+              , show (length xs)
+              , ", when checking lambda against type `"
+              , show (Fun typeParams domains codomain)
+              , "`"
+              ]
+      )
+      params
+  let kindCtx' = listInsertCtx typeParams kindCtx
+  let typeCtx' = listInsertCtx paramTypes typeCtx
+  bodyE <- body kindCtx' typeCtx' codomain -- TODO: Is there some capture avoiding substitution thing I'm forgetting here?
+  return (Lam (map (\(x, _) -> x) paramTypes) bodyE)
+
+
+lamCheckValidator :: Parsed l (Ctx Kind -> Ctx Type -> ([(Var, Kind)], [Type], Type) -> TC l Expr) -> (Ctx Kind -> Ctx Type -> Type -> TC l Expr)
 lamCheckValidator lamv kindCtx typeCtx t =
-  validatorJoin $ handle $ fmap
+  Monad.join $ handle $ fmap
     (\lamv' ->
       case t of
         Fun typeParams domains codomain -> Right (lamv' kindCtx typeCtx (typeParams, domains, codomain))
@@ -185,17 +214,59 @@ lamCheckValidator lamv kindCtx typeCtx t =
     )
     lamv
 
-lam :: Parser l Char (Ctx Kind -> Ctx Type -> Type -> Validator l Expr)
+lam :: Parser l Char (Ctx Kind -> Ctx Type -> Type -> TC l Expr)
 lam =
-  fmap lamCheckValidator $ startValidation
+  fmap lamCheckValidator $ validate
     ( lamValidator
-      <$> (tok '\\' *> whitespace *> startValidation var <* whitespace)
-      <*> many (tok ',' *> whitespace *> startValidation var <* whitespace)
+      <$> ( validate $ (\first rest -> (first, rest))
+              <$> (tok '\\' *> whitespace *> validate var <* whitespace)
+              <*> many (tok ',' *> whitespace *> validate var <* whitespace)
+          )
       <*> (tok '-' *> tok '>' *> whitespace *> check)
     )
 
-check :: Parser l Char (Ctx Kind -> Ctx Type -> Type -> Validator l Expr)
-check = _
+checkSynthValidator :: Parsed l (Ctx Kind -> Ctx Type -> TC l (Type, Expr)) -> (Ctx Kind -> Ctx Type -> Type -> TC l Expr)
+checkSynthValidator ps kindCtx typeCtx t = do
+  ps' <- sequenceA $ fmap
+    (\s -> do
+      (t', e) <- s kindCtx typeCtx
+      if t == t'
+      then return (Right e)
+      else return (Left (concat ["Expected an expression of type `", show t, "`, but found one of type `", show t', "`"]))
+    )
+    ps
+  handle ps'
 
-synth :: Parser l Char (Ctx Kind -> Ctx Type -> Validator l (Type, Expr))
-synth = _
+checkSynth :: Parser l Char (Ctx Kind -> Ctx Type -> Type -> TC l Expr)
+checkSynth = checkSynthValidator <$> validate synth
+
+check :: Parser l Char (Ctx Kind -> Ctx Type -> Type -> TC l Expr)
+check = lam <|> checkSynth
+
+varValidate :: Parsed l Var -> (Ctx Kind -> Ctx Type -> TC l (Type, Expr))
+varValidate v _ typeCtx =
+  handle $ fmap
+    (\x ->
+      case lookupCtx x typeCtx of
+        Just t -> Right (t, Var x)
+        Nothing -> Left (concat ["Unbound identifier `", show x, "`"])
+    )
+    v
+
+varSynth :: Parser l Char (Ctx Kind -> Ctx Type -> TC l (Type, Expr))
+varSynth = varValidate <$> validate var
+
+synth :: Parser l Char (Ctx Kind -> Ctx Type -> TC l (Type, Expr))
+synth = varSynth
+
+top :: Ctx Kind -> Ctx Type -> Type -> Parser l Char Expr
+top kindCtx typeCtx t = throw $ (\c -> c kindCtx typeCtx t) <$> check
+
+-- TODO: Capture avoiding substitution is messed up in following case
+-- parse
+--   (top
+--     [("b", Type)]
+--     [("b", TyVar "b")]
+--     (Fun [("a", Type), ("b", Type)] [TyVar "a"] (TyVar "b"))
+--   )
+--   "\\x -> b"

@@ -1,5 +1,6 @@
 module Stlc where
 
+{-
 import qualified Data.Char as Char
 import Data.String
 import Control.Applicative
@@ -106,3 +107,4 @@ topValidator ctx s = s ctx
 
 top :: Ctx Type -> Parser l Char (Type, Expr)
 top ctx = validate $ topValidator ctx <$> app
+-}
